@@ -1,0 +1,904 @@
+name: Build APK v4
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Create project files
+        run: |
+          mkdir -p proj && cd proj
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'__END_OF_FILE__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.reelcounter.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.reelcounter.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+
+              buildFeatures {
+                  compose = true
+              }
+
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.14"
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@style/Theme.ReelCounter">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ReelCounterService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+
+                  <receiver
+                      android:name=".CounterWidget"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                          <action android:name="android.intent.action.DATE_CHANGED" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/counter_widget_info" />
+                  </receiver>
+
+              </application>
+
+          </manifest>
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/java/com/reelcounter/app/CounterStore.kt')"
+          cat > 'app/src/main/java/com/reelcounter/app/CounterStore.kt' <<'__END_OF_FILE__'
+          package com.reelcounter.app
+
+          import android.content.Context
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.StateFlow
+          import java.time.LocalDate
+
+          /** Stores one counter per day per app in SharedPreferences, entirely on-device. */
+          object CounterStore {
+
+              data class DayCount(val date: LocalDate, val count: Int)
+
+              data class Snapshot(
+                  val todayByApp: Map<String, Int> = emptyMap(),
+                  val last7Days: List<DayCount> = emptyList(),
+              ) {
+                  val todayTotal: Int get() = todayByApp.values.sum()
+              }
+
+              private const val PREFS = "reel_counts"
+
+              private val _state = MutableStateFlow(Snapshot())
+              val state: StateFlow<Snapshot> = _state
+
+              private fun prefs(context: Context) =
+                  context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              private fun key(date: LocalDate, appKey: String) = "$date|$appKey"
+
+              private const val KEY_POPUP = "popup_enabled"
+
+              fun isPopupEnabled(context: Context): Boolean =
+                  prefs(context).getBoolean(KEY_POPUP, true)
+
+              fun setPopupEnabled(context: Context, enabled: Boolean) {
+                  prefs(context).edit().putBoolean(KEY_POPUP, enabled).apply()
+              }
+
+              @Synchronized
+              fun refresh(context: Context) {
+                  val all = prefs(context).all
+                  val today = LocalDate.now()
+
+                  val totalsByDate = HashMap<LocalDate, Int>()
+                  val todayByApp = HashMap<String, Int>()
+
+                  for ((k, v) in all) {
+                      val count = v as? Int ?: continue
+                      val parts = k.split("|")
+                      if (parts.size != 2) continue
+                      val date = runCatching { LocalDate.parse(parts[0]) }.getOrNull() ?: continue
+                      totalsByDate[date] = (totalsByDate[date] ?: 0) + count
+                      if (date == today) todayByApp[parts[1]] = count
+                  }
+
+                  val last7 = (6 downTo 0).map { daysAgo ->
+                      val d = today.minusDays(daysAgo.toLong())
+                      DayCount(d, totalsByDate[d] ?: 0)
+                  }
+
+                  _state.value = Snapshot(todayByApp = todayByApp, last7Days = last7)
+              }
+
+              @Synchronized
+              fun increment(context: Context, appKey: String) {
+                  val p = prefs(context)
+                  val k = key(LocalDate.now(), appKey)
+                  p.edit().putInt(k, p.getInt(k, 0) + 1).apply()
+                  refresh(context)
+                  CounterWidget.updateAll(context)
+              }
+
+              @Synchronized
+              fun resetToday(context: Context) {
+                  val p = prefs(context)
+                  val prefix = "${LocalDate.now()}|"
+                  val editor = p.edit()
+                  p.all.keys.filter { it.startsWith(prefix) }.forEach { editor.remove(it) }
+                  editor.apply()
+                  refresh(context)
+                  CounterWidget.updateAll(context)
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/java/com/reelcounter/app/CounterWidget.kt')"
+          cat > 'app/src/main/java/com/reelcounter/app/CounterWidget.kt' <<'__END_OF_FILE__'
+          package com.reelcounter.app
+
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.widget.RemoteViews
+
+          /** Home screen widget showing today's total and the per-app counts. Tap it to open the app. */
+          class CounterWidget : AppWidgetProvider() {
+
+              override fun onUpdate(
+                  context: Context,
+                  appWidgetManager: AppWidgetManager,
+                  appWidgetIds: IntArray,
+              ) {
+                  CounterStore.refresh(context)
+                  val views = buildViews(context)
+                  appWidgetIds.forEach { appWidgetManager.updateAppWidget(it, views) }
+              }
+
+              override fun onReceive(context: Context, intent: Intent) {
+                  super.onReceive(context, intent)
+                  // At midnight, roll the widget over to the new day's (zero) count.
+                  if (intent.action == Intent.ACTION_DATE_CHANGED) {
+                      CounterStore.refresh(context)
+                      updateAll(context)
+                  }
+              }
+
+              companion object {
+
+                  /** Redraws every placed widget from the current counts. */
+                  fun updateAll(context: Context) {
+                      val app = context.applicationContext
+                      val manager = AppWidgetManager.getInstance(app)
+                      val ids = manager.getAppWidgetIds(ComponentName(app, CounterWidget::class.java))
+                      if (ids.isEmpty()) return
+                      val views = buildViews(app)
+                      ids.forEach { manager.updateAppWidget(it, views) }
+                  }
+
+                  private fun shortName(key: String) = when (key) {
+                      "instagram" -> "IG"
+                      "youtube" -> "YT"
+                      "tiktok" -> "TT"
+                      else -> key
+                  }
+
+                  private fun buildViews(context: Context): RemoteViews {
+                      val snapshot = CounterStore.state.value
+                      val views = RemoteViews(context.packageName, R.layout.widget_counter)
+
+                      views.setTextViewText(R.id.widget_count, snapshot.todayTotal.toString())
+                      views.setTextViewText(
+                          R.id.widget_breakdown,
+                          ShortApps.all.joinToString("  ·  ") {
+                              "${shortName(it.key)} ${snapshot.todayByApp[it.key] ?: 0}"
+                          },
+                      )
+
+                      val openApp = PendingIntent.getActivity(
+                          context,
+                          0,
+                          Intent(context, MainActivity::class.java),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                      )
+                      views.setOnClickPendingIntent(R.id.widget_root, openApp)
+                      return views
+                  }
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/java/com/reelcounter/app/MainActivity.kt')"
+          cat > 'app/src/main/java/com/reelcounter/app/MainActivity.kt' <<'__END_OF_FILE__'
+          package com.reelcounter.app
+
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.statusBarsPadding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.CardDefaults
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.lightColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.collectAsState
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.coerceAtLeast
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import java.time.format.TextStyle
+          import java.util.Locale
+
+          class MainActivity : ComponentActivity() {
+
+              private var serviceEnabled by mutableStateOf(false)
+              private var popupEnabled by mutableStateOf(true)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  CounterStore.refresh(applicationContext)
+                  popupEnabled = CounterStore.isPopupEnabled(applicationContext)
+
+                  setContent {
+                      MaterialTheme(
+                          colorScheme = lightColorScheme(
+                              primary = Color(0xFF6C4CF1),
+                              background = Color(0xFFF7F6FB),
+                              surface = Color.White,
+                          )
+                      ) {
+                          val snapshot by CounterStore.state.collectAsState()
+                          HomeScreen(
+                              snapshot = snapshot,
+                              serviceEnabled = serviceEnabled,
+                              onEnableClick = {
+                                  startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                              },
+                              onResetClick = { CounterStore.resetToday(applicationContext) },
+                              popupEnabled = popupEnabled,
+                              onPopupChange = {
+                                  popupEnabled = it
+                                  CounterStore.setPopupEnabled(applicationContext, it)
+                              },
+                          )
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  serviceEnabled = isServiceEnabled()
+                  CounterStore.refresh(applicationContext)
+              }
+
+              private fun isServiceEnabled(): Boolean {
+                  val enabled = Settings.Secure.getString(
+                      contentResolver,
+                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                  ) ?: return false
+                  val mine = ComponentName(this, ReelCounterService::class.java)
+                  return enabled.split(':').any {
+                      ComponentName.unflattenFromString(it) == mine
+                  }
+              }
+          }
+
+          @Composable
+          private fun HomeScreen(
+              snapshot: CounterStore.Snapshot,
+              serviceEnabled: Boolean,
+              onEnableClick: () -> Unit,
+              onResetClick: () -> Unit,
+              popupEnabled: Boolean,
+              onPopupChange: (Boolean) -> Unit,
+          ) {
+              Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .background(MaterialTheme.colorScheme.background)
+                      .statusBarsPadding()
+                      .verticalScroll(rememberScrollState())
+                      .padding(20.dp),
+                  verticalArrangement = Arrangement.spacedBy(16.dp),
+              ) {
+                  Text("Reel Counter", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+
+                  if (!serviceEnabled) {
+                      Card(
+                          colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF1D6)),
+                          modifier = Modifier.fillMaxWidth(),
+                      ) {
+                          Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Text("Counting is off", fontWeight = FontWeight.SemiBold)
+                              Text(
+                                  "Turn on Reel Counter in Accessibility settings so it can notice " +
+                                      "when you scroll through reels. It never reads what you watch or type.",
+                                  fontSize = 14.sp,
+                              )
+                              Button(onClick = onEnableClick) { Text("Open Accessibility settings") }
+                          }
+                      }
+                  }
+
+                  Card(
+                      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary),
+                      modifier = Modifier.fillMaxWidth(),
+                  ) {
+                      Column(
+                          Modifier
+                              .fillMaxWidth()
+                              .padding(24.dp),
+                          horizontalAlignment = Alignment.CenterHorizontally,
+                      ) {
+                          Text("Today", color = Color.White.copy(alpha = 0.8f), fontSize = 14.sp)
+                          Text(
+                              "${snapshot.todayTotal}",
+                              color = Color.White,
+                              fontSize = 64.sp,
+                              fontWeight = FontWeight.Bold,
+                          )
+                          Text("reels & shorts", color = Color.White.copy(alpha = 0.8f), fontSize = 14.sp)
+                      }
+                  }
+
+                  Card(
+                      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                      modifier = Modifier.fillMaxWidth(),
+                  ) {
+                      Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                          Text("By app", fontWeight = FontWeight.SemiBold)
+                          ShortApps.all.forEach { app ->
+                              Row(
+                                  Modifier.fillMaxWidth(),
+                                  horizontalArrangement = Arrangement.SpaceBetween,
+                              ) {
+                                  Text(app.label)
+                                  Text("${snapshot.todayByApp[app.key] ?: 0}", fontWeight = FontWeight.SemiBold)
+                              }
+                          }
+                      }
+                  }
+
+                  Card(
+                      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                      modifier = Modifier.fillMaxWidth(),
+                  ) {
+                      Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                          Text("Last 7 days", fontWeight = FontWeight.SemiBold)
+                          WeekChart(snapshot.last7Days)
+                      }
+                  }
+
+                  Card(
+                      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                      modifier = Modifier.fillMaxWidth(),
+                  ) {
+                      Row(
+                          Modifier
+                              .fillMaxWidth()
+                              .padding(16.dp),
+                          horizontalArrangement = Arrangement.SpaceBetween,
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Column(Modifier.weight(1f)) {
+                              Text("Show popup while scrolling", fontWeight = FontWeight.SemiBold)
+                              Text("Shows your count over the app after each reel", fontSize = 13.sp)
+                          }
+                          Switch(checked = popupEnabled, onCheckedChange = onPopupChange)
+                      }
+                  }
+
+                  OutlinedButton(onClick = onResetClick, modifier = Modifier.fillMaxWidth()) {
+                      Text("Reset today's count")
+                  }
+              }
+          }
+
+          @Composable
+          private fun WeekChart(days: List<CounterStore.DayCount>) {
+              val max = (days.maxOfOrNull { it.count } ?: 0).coerceAtLeast(1)
+              val chartHeight = 120.dp
+
+              Row(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .height(chartHeight + 36.dp),
+                  horizontalArrangement = Arrangement.SpaceBetween,
+                  verticalAlignment = Alignment.Bottom,
+              ) {
+                  days.forEach { day ->
+                      Column(
+                          modifier = Modifier.width(36.dp),
+                          horizontalAlignment = Alignment.CenterHorizontally,
+                          verticalArrangement = Arrangement.Bottom,
+                      ) {
+                          Text("${day.count}", fontSize = 11.sp)
+                          Spacer(Modifier.height(4.dp))
+                          Box(
+                              modifier = Modifier
+                                  .width(22.dp)
+                                  .height((chartHeight.value * day.count / max).dp.coerceAtLeast(4.dp))
+                                  .clip(RoundedCornerShape(6.dp))
+                                  .background(MaterialTheme.colorScheme.primary.copy(alpha = if (day.count == 0) 0.2f else 1f)),
+                          )
+                          Spacer(Modifier.height(4.dp))
+                          Text(
+                              day.date.dayOfWeek.getDisplayName(TextStyle.SHORT, Locale.getDefault()),
+                              fontSize = 11.sp,
+                          )
+                      }
+                  }
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/java/com/reelcounter/app/ReelCounterService.kt')"
+          cat > 'app/src/main/java/com/reelcounter/app/ReelCounterService.kt' <<'__END_OF_FILE__'
+          package com.reelcounter.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.util.Log
+          import android.util.TypedValue
+          import android.view.Gravity
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.TextView
+
+          /**
+           * Listens for scroll events in the supported apps. When the thing being scrolled is the
+           * app's reel pager, it counts one reel. It never reads text, only the scrolled view's
+           * id and class name.
+           */
+          class ReelCounterService : AccessibilityService() {
+
+              private var lastCountAt = 0L
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var badge: TextView? = null
+              private val hideBadge = Runnable { removeBadge() }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  CounterStore.refresh(applicationContext)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  if (event == null || event.eventType != AccessibilityEvent.TYPE_VIEW_SCROLLED) return
+
+                  val pkg = event.packageName?.toString() ?: return
+                  val app = ShortApps.byPackage(pkg) ?: return
+
+                  val source = event.source
+                  val viewId = source?.viewIdResourceName.orEmpty()
+                  val className = event.className?.toString().orEmpty()
+                  @Suppress("DEPRECATION")
+                  source?.recycle()
+
+                  Log.d(TAG, "scroll pkg=$pkg id=$viewId class=$className")
+
+                  val matches = app.idMarkers.any { viewId.contains(it, ignoreCase = true) } ||
+                      app.classMarkers.any { className.contains(it, ignoreCase = true) }
+                  if (!matches) return
+
+                  // One swipe can fire several scroll events; count it once.
+                  val now = SystemClock.elapsedRealtime()
+                  if (now - lastCountAt < MIN_GAP_MS) return
+                  lastCountAt = now
+
+                  CounterStore.increment(applicationContext, app.key)
+
+                  if (CounterStore.isPopupEnabled(applicationContext)) {
+                      val n = CounterStore.state.value.todayByApp[app.key] ?: 0
+                      showBadge("${app.label}: $n today")
+                  }
+              }
+
+              /** Small pill at the top of the screen. It can't be touched, so it never blocks the app. */
+              private fun showBadge(text: String) {
+                  val existing = badge
+                  if (existing != null) {
+                      existing.text = text
+                  } else {
+                      val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                      val tv = TextView(this).apply {
+                          this.text = text
+                          setTextColor(Color.WHITE)
+                          setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                          typeface = Typeface.DEFAULT_BOLD
+                          setPadding(dp(16), dp(10), dp(16), dp(10))
+                          background = GradientDrawable().apply {
+                              setColor(Color.argb(230, 108, 76, 241))
+                              cornerRadius = dp(24).toFloat()
+                          }
+                      }
+                      val params = WindowManager.LayoutParams(
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.WRAP_CONTENT,
+                          WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                          PixelFormat.TRANSLUCENT,
+                      ).apply {
+                          gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                          y = dp(90)
+                      }
+                      try {
+                          wm.addView(tv, params)
+                          badge = tv
+                      } catch (e: Exception) {
+                          Log.w(TAG, "Could not show popup", e)
+                          return
+                      }
+                  }
+                  handler.removeCallbacks(hideBadge)
+                  handler.postDelayed(hideBadge, BADGE_MS)
+              }
+
+              private fun removeBadge() {
+                  val view = badge ?: return
+                  try {
+                      (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(view)
+                  } catch (_: Exception) {
+                  }
+                  badge = null
+              }
+
+              private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+              override fun onInterrupt() {
+                  handler.removeCallbacks(hideBadge)
+                  removeBadge()
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(hideBadge)
+                  removeBadge()
+                  super.onDestroy()
+              }
+
+              companion object {
+                  private const val TAG = "ReelCounter"
+                  private const val MIN_GAP_MS = 900L
+                  private const val BADGE_MS = 2500L
+              }
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/java/com/reelcounter/app/ShortApps.kt')"
+          cat > 'app/src/main/java/com/reelcounter/app/ShortApps.kt' <<'__END_OF_FILE__'
+          package com.reelcounter.app
+
+          /**
+           * The apps we count reels/shorts in.
+           *
+           * Detection is best-effort: each app names its vertical "reel pager" view differently,
+           * and those names can change in app updates. If counting stops working for one app,
+           * run the app, scroll a few reels, and look at Logcat (tag "ReelCounter") to see the
+           * view id / class of the scrolled view, then add it to [idMarkers] or [classMarkers].
+           */
+          data class ShortApp(
+              val key: String,
+              val label: String,
+              val packages: List<String>,
+              /** Substrings of the scrolled view's resource id that mean "this is the reel pager". */
+              val idMarkers: List<String>,
+              /** Substrings of the scrolled view's class name, for apps that hide their ids. */
+              val classMarkers: List<String> = emptyList(),
+          )
+
+          object ShortApps {
+              val all = listOf(
+                  ShortApp(
+                      key = "instagram",
+                      label = "Instagram Reels",
+                      packages = listOf("com.instagram.android"),
+                      idMarkers = listOf("clips_viewer_view_pager", "clips_viewer"),
+                  ),
+                  ShortApp(
+                      key = "youtube",
+                      label = "YouTube Shorts",
+                      packages = listOf("com.google.android.youtube"),
+                      idMarkers = listOf("reel_recycler", "reel_player_page_container", "shorts"),
+                  ),
+                  ShortApp(
+                      key = "tiktok",
+                      label = "TikTok",
+                      packages = listOf("com.zhiliaoapp.musically", "com.ss.android.ugc.trill"),
+                      idMarkers = listOf("viewpager", "view_pager"),
+                      classMarkers = listOf("ViewPager", "RecyclerView"),
+                  ),
+              )
+
+              fun byPackage(pkg: String): ShortApp? = all.firstOrNull { pkg in it.packages }
+
+              fun byKey(key: String): ShortApp? = all.firstOrNull { it.key == key }
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_launcher.xml')"
+          cat > 'app/src/main/res/drawable/ic_launcher.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#6C4CF1"
+                  android:pathData="M0,0h108v108h-108z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M38,28h32a6,6 0 0 1 6,6v40a6,6 0 0 1 -6,6h-32a6,6 0 0 1 -6,-6v-40a6,6 0 0 1 6,-6z" />
+              <path
+                  android:fillColor="#6C4CF1"
+                  android:pathData="M48,42l16,12l-16,12z" />
+          </vector>
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/res/drawable/widget_bg.xml')"
+          cat > 'app/src/main/res/drawable/widget_bg.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="#6C4CF1" />
+              <corners android:radius="22dp" />
+          </shape>
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/res/layout/widget_counter.xml')"
+          cat > 'app/src/main/res/layout/widget_counter.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:gravity="center"
+              android:orientation="vertical"
+              android:padding="12dp">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="Today"
+                  android:textColor="#CCFFFFFF"
+                  android:textSize="12sp" />
+
+              <TextView
+                  android:id="@+id/widget_count"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="0"
+                  android:textColor="#FFFFFF"
+                  android:textSize="44sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="reels &amp; shorts"
+                  android:textColor="#CCFFFFFF"
+                  android:textSize="12sp" />
+
+              <TextView
+                  android:id="@+id/widget_breakdown"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="6dp"
+                  android:maxLines="1"
+                  android:text=""
+                  android:textColor="#CCFFFFFF"
+                  android:textSize="11sp" />
+
+          </LinearLayout>
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Reel Counter</string>
+              <string name="widget_description">Shows how many reels and shorts you watched today.</string>
+              <string name="service_description">Counts how many Reels and Shorts you scroll through in Instagram, YouTube and TikTok. It only sees that a scroll happened, never what you watch or type. Counts stay on this phone.</string>
+          </resources>
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
+          cat > 'app/src/main/res/values/themes.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.ReelCounter" parent="android:Theme.Material.Light.NoActionBar" />
+          </resources>
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/res/xml/accessibility_service_config.xml')"
+          cat > 'app/src/main/res/xml/accessibility_service_config.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeViewScrolled"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:packageNames="com.instagram.android,com.google.android.youtube,com.zhiliaoapp.musically,com.ss.android.ugc.trill"
+              android:description="@string/service_description" />
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'app/src/main/res/xml/counter_widget_info.xml')"
+          cat > 'app/src/main/res/xml/counter_widget_info.xml' <<'__END_OF_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/widget_description"
+              android:initialLayout="@layout/widget_counter"
+              android:minWidth="180dp"
+              android:minHeight="110dp"
+              android:resizeMode="horizontal|vertical"
+              android:updatePeriodMillis="1800000"
+              android:widgetCategory="home_screen" />
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'__END_OF_FILE__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'__END_OF_FILE__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'gradle/wrapper/gradle-wrapper.properties')"
+          cat > 'gradle/wrapper/gradle-wrapper.properties' <<'__END_OF_FILE__'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          __END_OF_FILE__
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'__END_OF_FILE__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "ReelCounter"
+          include(":app")
+          __END_OF_FILE__
+
+      - name: Build debug APK
+        run: cd proj && gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReelCounter-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp proj/app/build/outputs/apk/debug/app-debug.apk ReelCounter.apk
+          gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest ReelCounter.apk --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Reel Counter latest build" --notes "Download ReelCounter.apk and tap it to install."
